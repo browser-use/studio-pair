@@ -455,8 +455,8 @@ fn run(
 }
 fn main() {
     unsafe {
-        signal(2, stop_signal as usize);
-        signal(15, stop_signal as usize);
+        signal(2, stop_signal as *const () as usize);
+        signal(15, stop_signal as *const () as usize);
         signal(13, 1);
     }
     let args: Vec<String> = std::env::args().collect();
