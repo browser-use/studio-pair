@@ -47,6 +47,9 @@ private final class SpeakerCard: NSView {
 
 final class App: NSObject, NSApplicationDelegate {
     private let defaults = UserDefaults.standard
+    private let displayMode = DisplayMode()
+    private let displaySwitch = NSSwitch()
+    private let displayLabel = NSTextField(wrappingLabelWithString: "MacBook screen on")
     private let engine = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/studio-pair-engine")
     private let runtime = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("StudioPair")
     private var journal: URL { runtime.appendingPathComponent("journal.json") }
@@ -113,6 +116,8 @@ final class App: NSObject, NSApplicationDelegate {
             }
         } catch { NSLog("Studio Pair could not open its runtime: %@", error.localizedDescription); NSApp.terminate(nil); return }
         log("app_start pid=\(getpid()) bundle=\(Bundle.main.bundleURL.path)")
+        displayMode.changed = { [weak self] in self?.refresh() }
+        displayMode.start()
         makeInterface()
         if disableLoginOnStart {
             enabled = false
@@ -123,9 +128,10 @@ final class App: NSObject, NSApplicationDelegate {
         else if args.contains("--enable-login") { setLogin(true) }
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-            guard let self = self else { return }; self.sleeping = true; self.stopWorker()
+            guard let self = self else { return }; self.sleeping = true; self.displayMode.suspend(true); self.stopWorker()
         })
         observers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.displayMode.suspend(false)
             self?.sleeping = false; self?.nextAttempt = Date().addingTimeInterval(2)
         })
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
@@ -152,7 +158,7 @@ final class App: NSObject, NSApplicationDelegate {
         popover.behavior = .transient
         popover.animates = true
         let controller = NSViewController()
-        controller.view = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 364))
+        controller.view = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 452))
         let stack = NSStackView()
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 17
         controller.view.addSubview(stack)
@@ -187,6 +193,18 @@ final class App: NSObject, NSApplicationDelegate {
         stack.addArrangedSubview(speakers)
         footerLabel.font = .systemFont(ofSize: 11); footerLabel.textColor = .secondaryLabelColor
         stack.addArrangedSubview(footerLabel)
+        let displayTitle = NSTextField(labelWithString: "Studio Displays only")
+        displayTitle.font = .systemFont(ofSize: 13, weight: .medium)
+        displaySwitch.target = self; displaySwitch.action = #selector(toggleDisplayMode)
+        displaySwitch.setAccessibilityLabel("Studio Displays only")
+        displaySwitch.toolTip = "Turn off the MacBook screen when both Studio Displays are connected. Restore it on disconnect or quit."
+        let displaySpacer = NSView(); displaySpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let displayRow = NSStackView(views: [displayTitle, displaySpacer, displaySwitch])
+        stack.addArrangedSubview(displayRow)
+        displayRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        displayLabel.font = .systemFont(ofSize: 11); displayLabel.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(displayLabel)
+        displayLabel.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         let divider = NSBox(); divider.boxType = .separator
         stack.addArrangedSubview(divider); divider.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         loginButton.target = self; loginButton.action = #selector(toggleLogin)
@@ -219,10 +237,13 @@ final class App: NSObject, NSApplicationDelegate {
         let text = recovering ? (needsRestore ? "Reconnect displays to restore audio" : "Restoring direct playback") : (!enabled ? "Off · direct playback" : phase)
         stateLabel.stringValue = text
         stateLabel.textColor = active ? .systemGreen : .secondaryLabelColor
+        displaySwitch.state = displayMode.enabled ? .on : .off
+        displaySwitch.isEnabled = !quitting && displayMode.supported
+        displayLabel.stringValue = displayMode.status
         pairingSwitch.state = enabled ? .on : .off
         pairingSwitch.isEnabled = !quitting
         item.button?.toolTip = "Studio Pair · \(text)"
-        item.button?.appearsDisabled = !enabled
+        item.button?.appearsDisabled = !enabled && !displayMode.enabled
         let swapped = !anchorUID.isEmpty && leftUID != anchorUID
         leftCard.assignment.stringValue = swapped ? "Display B" : "Display A"
         rightCard.assignment.stringValue = swapped ? "Display A" : "Display B"
@@ -233,6 +254,11 @@ final class App: NSObject, NSApplicationDelegate {
         loginButton.state = login == .enabled ? .on : (login == .requiresApproval ? .mixed : .off)
         loginButton.title = login == .requiresApproval ? "Approve launch at login…" : "Launch at login"
         publish()
+    }
+
+    @objc private func toggleDisplayMode() {
+        displayMode.enabled = displaySwitch.state == .on
+        refresh()
     }
 
     @objc private func togglePairing() {
@@ -265,6 +291,7 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     private func tick() {
+        if !quitting { displayMode.tick() }
         for (name, action) in [("stop.request", 0), ("disable-login.request", 1), ("show.request", 2), ("quit.request", 3)] {
             let file = runtime.appendingPathComponent(name)
             if FileManager.default.fileExists(atPath: file.path) {
@@ -384,6 +411,7 @@ final class App: NSObject, NSApplicationDelegate {
     @objc private func quitApp() { NSApp.terminate(nil) }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         quitting = true
+        displayMode.stop()
         if worker != nil || restoring { stopWorker(); return .terminateLater }
         return .terminateNow
     }
@@ -416,6 +444,7 @@ final class App: NSObject, NSApplicationDelegate {
         let status: [String: Any] = ["version": 2, "enabled": enabled, "phase": phase, "active": active,
             "workerPID": worker?.processIdentifier ?? 0, "appPID": getpid(), "loginStatus": SMAppService.mainApp.status.rawValue,
             "bundlePath": Bundle.main.bundleURL.path, "leftDisplayUID": leftUID, "anchorUID": anchorUID,
+            "studioDisplaysOnly": displayMode.enabled, "displayStatus": displayMode.status,
             "restoring": restoring, "sleeping": sleeping, "lastFailure": lastFailure ?? ""]
         guard let data = try? JSONSerialization.data(withJSONObject: status, options: [.prettyPrinted, .sortedKeys]), data != lastPublished else { return }
         lastPublished = data
@@ -425,8 +454,14 @@ final class App: NSObject, NSApplicationDelegate {
     }
 }
 
-let app = NSApplication.shared
-let delegate = App()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
+@main
+enum StudioPairMain {
+    static func main() {
+        signal(SIGPIPE, SIG_IGN)
+        let app = NSApplication.shared
+        let delegate = App()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        app.run()
+    }
+}
